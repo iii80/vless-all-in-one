@@ -17,7 +17,7 @@
 #  项目地址: https://github.com/Chil30/vless-all-in-one
 #═══════════════════════════════════════════════════════════════════════════════
 
-readonly VERSION="3.1.9"
+readonly VERSION="3.1.10"
 readonly AUTHOR="Chil30"
 readonly REPO_URL="https://github.com/Chil30/vless-all-in-one"
 readonly CFG="/etc/vless-reality"
@@ -550,8 +550,8 @@ generate_xray_config() {
     
     mkdir -p "$CFG"
     
-    # 读取直连出口 IP 版本设置（默认优先 IPv6）
-    local direct_ip_version="prefer_ipv6"
+    # 读取直连出口 IP 版本设置（默认 AsIs）
+    local direct_ip_version="as_is"
     [[ -f "$CFG/direct_ip_version" ]] && direct_ip_version=$(cat "$CFG/direct_ip_version")
     
     # 根据设置生成 freedom 出口配置
@@ -564,10 +564,13 @@ generate_xray_config() {
             direct_outbound='{"protocol": "freedom", "tag": "direct", "settings": {"domainStrategy": "UseIPv6"}}'
             ;;
         prefer_ipv4)
-            direct_outbound='{"protocol": "freedom", "tag": "direct", "settings": {"domainStrategy": "PreferIPv4"}}'
+            direct_outbound='{"protocol": "freedom", "tag": "direct", "settings": {"domainStrategy": "UseIPv4"}}'
             ;;
         prefer_ipv6)
-            direct_outbound='{"protocol": "freedom", "tag": "direct", "settings": {"domainStrategy": "PreferIPv6"}}'
+            direct_outbound='{"protocol": "freedom", "tag": "direct", "settings": {"domainStrategy": "UseIPv6"}}'
+            ;;
+        as_is|asis)
+            direct_outbound='{"protocol": "freedom", "tag": "direct"}'
             ;;
     esac
     
@@ -604,13 +607,19 @@ generate_xray_config() {
                         ;;
                     prefer_ipv6)
                         if ! echo "$outbounds" | jq -e --arg tag "direct-prefer-ipv6" '.[] | select(.tag == $tag)' >/dev/null 2>&1; then
-                            local direct_prefer_ipv6_out='{"protocol": "freedom", "tag": "direct-prefer-ipv6", "settings": {"domainStrategy": "PreferIPv6"}}'
+                            local direct_prefer_ipv6_out='{"protocol": "freedom", "tag": "direct-prefer-ipv6", "settings": {"domainStrategy": "UseIPv6"}}'
                             outbounds=$(echo "$outbounds" | jq --argjson out "$direct_prefer_ipv6_out" '. + [$out]')
+                        fi
+                        ;;
+                    as_is|asis)
+                        if ! echo "$outbounds" | jq -e --arg tag "direct-asis" '.[] | select(.tag == $tag)' >/dev/null 2>&1; then
+                            local direct_asis_out='{"protocol": "freedom", "tag": "direct-asis"}'
+                            outbounds=$(echo "$outbounds" | jq --argjson out "$direct_asis_out" '. + [$out]')
                         fi
                         ;;
                     prefer_ipv4|*)
                         if ! echo "$outbounds" | jq -e --arg tag "direct-prefer-ipv4" '.[] | select(.tag == $tag)' >/dev/null 2>&1; then
-                            local direct_prefer_ipv4_out='{"protocol": "freedom", "tag": "direct-prefer-ipv4", "settings": {"domainStrategy": "PreferIPv4"}}'
+                            local direct_prefer_ipv4_out='{"protocol": "freedom", "tag": "direct-prefer-ipv4", "settings": {"domainStrategy": "UseIPv4"}}'
                             outbounds=$(echo "$outbounds" | jq --argjson out "$direct_prefer_ipv4_out" '. + [$out]')
                         fi
                         ;;
@@ -629,11 +638,11 @@ generate_xray_config() {
                         ;;
                     prefer_ipv6)
                         warp_tag="warp-prefer-ipv6"
-                        warp_strategy="PreferIPv6"
+                        warp_strategy="UseIPv6"
                         ;;
                     prefer_ipv4|*)
                         warp_tag="warp-prefer-ipv4"
-                        warp_strategy="PreferIPv4"
+                        warp_strategy="UseIPv4"
                         ;;
                 esac
                 if ! echo "$outbounds" | jq -e --arg tag "$warp_tag" '.[] | select(.tag == $tag)' >/dev/null 2>&1; then
@@ -670,11 +679,11 @@ generate_xray_config() {
                 # 没有 warp outbound，生成一个默认的
                 local warp_out=$(gen_xray_warp_outbound)
                 if [[ -n "$warp_out" ]]; then
-                    # 使用默认 tag "warp"，默认策略 PreferIPv4
+                    # 使用默认 tag "warp"，默认策略 UseIPv4
                     local warp_out_default=$(echo "$warp_out" | jq '.tag = "warp"')
                     # 只有 WireGuard 类型才需要 domainStrategy
                     if echo "$warp_out_default" | jq -e '.protocol == "wireguard"' >/dev/null 2>&1; then
-                        warp_out_default=$(echo "$warp_out_default" | jq '.settings.domainStrategy = "PreferIPv4"')
+                        warp_out_default=$(echo "$warp_out_default" | jq '.settings.domainStrategy = "UseIPv4"')
                     fi
                     outbounds=$(echo "$outbounds" | jq --argjson out "$warp_out_default" '. + [$out]')
                 fi
@@ -907,7 +916,6 @@ add_xray_inbound_v2() {
                 --arg dest "$reality_dest" \
             '{
                 port: $port,
-                listen: "::",
                 protocol: "vless",
                 settings: {
                     clients: [{id: $uuid, flow: "xtls-rprx-vision"}],
@@ -939,7 +947,6 @@ add_xray_inbound_v2() {
                 --argjson fallbacks "$fallbacks" \
             '{
                 port: $port,
-                listen: "::",
                 protocol: "vless",
                 settings: {
                     clients: [{id: $uuid, flow: "xtls-rprx-vision"}],
@@ -991,7 +998,6 @@ add_xray_inbound_v2() {
                     --arg key "$CFG/certs/server.key" \
                 '{
                     port: $port,
-                    listen: "::",
                     protocol: "vless",
                     settings: {
                         clients: [{id: $uuid}],
@@ -1020,7 +1026,6 @@ add_xray_inbound_v2() {
                 --arg dest "$reality_dest" \
             '{
                 port: $port,
-                listen: "::",
                 protocol: "vless",
                 settings: {clients: [{id: $uuid}], decryption: "none"},
                 streamSettings: {
@@ -1069,7 +1074,6 @@ add_xray_inbound_v2() {
                     --arg key "$CFG/certs/server.key" \
                 '{
                     port: $port,
-                    listen: "::",
                     protocol: "vmess",
                     settings: {clients: [{id: $uuid, alterId: 0, security: "auto"}]},
                     streamSettings: {
@@ -1094,7 +1098,6 @@ add_xray_inbound_v2() {
                 --argjson fallbacks "$fallbacks" \
             '{
                 port: $port,
-                listen: "::",
                 protocol: "trojan",
                 settings: {
                     clients: [{password: $password}],
@@ -1115,7 +1118,6 @@ add_xray_inbound_v2() {
                 --arg password "$password" \
             '{
                 port: $port,
-                listen: "::",
                 protocol: "socks",
                 settings: {
                     auth: "password",
@@ -1134,7 +1136,6 @@ add_xray_inbound_v2() {
                 --arg tag "$protocol" \
             '{
                 port: $port,
-                listen: "::",
                 protocol: "shadowsocks",
                 settings: {
                     method: $method,
@@ -3456,27 +3457,48 @@ generate_singbox_config() {
     
     mkdir -p "$CFG"
     
-    # 读取直连出口 IP 版本设置，作为 sing-box domain_strategy（默认优先 IPv6）
-    local direct_ip_version="prefer_ipv6"
+    # 读取直连出口 IP 版本设置（默认 AsIs）
+    local direct_ip_version="as_is"
     [[ -f "$CFG/direct_ip_version" ]] && direct_ip_version=$(cat "$CFG/direct_ip_version")
-    local direct_domain_strategy=""
+    
+    # 根据设置生成 direct 出口配置
+    local direct_outbound=""
     case "$direct_ip_version" in
-        ipv4_only|ipv6_only|prefer_ipv4|prefer_ipv6)
-            direct_domain_strategy="$direct_ip_version"
+        ipv4|ipv4_only)
+            direct_outbound=$(jq -n '{
+                type: "direct",
+                tag: "direct",
+                domain_strategy: "ipv4_only"
+            }')
             ;;
-        ipv4)
-            direct_domain_strategy="ipv4_only"
+        ipv6|ipv6_only)
+            direct_outbound=$(jq -n '{
+                type: "direct",
+                tag: "direct",
+                domain_strategy: "ipv6_only"
+            }')
             ;;
-        ipv6)
-            direct_domain_strategy="ipv6_only"
+        prefer_ipv4)
+            direct_outbound=$(jq -n '{
+                type: "direct",
+                tag: "direct",
+                domain_strategy: "prefer_ipv4"
+            }')
+            ;;
+        prefer_ipv6)
+            direct_outbound=$(jq -n '{
+                type: "direct",
+                tag: "direct",
+                domain_strategy: "prefer_ipv6"
+            }')
+            ;;
+        as_is|asis|*)
+            direct_outbound=$(jq -n '{
+                type: "direct",
+                tag: "direct"
+            }')
             ;;
     esac
-    
-    # 使用 jq 构建直连出口，避免手写 JSON
-    local direct_outbound=$(jq -n --arg ds "$direct_domain_strategy" '{
-        type: "direct",
-        tag: "direct"
-    } | if $ds != "" then .domain_strategy = $ds else . end')
     
     # 收集所有需要的出口
     local outbounds=$(jq -n --argjson direct "$direct_outbound" '[$direct, {type: "block", tag: "block"}]')
@@ -3528,6 +3550,15 @@ generate_singbox_config() {
                             outbounds=$(echo "$outbounds" | jq --argjson out "$direct_prefer_ipv6_out" '. + [$out]')
                         fi
                         ;;
+                    as_is|asis)
+                        if ! echo "$outbounds" | jq -e --arg tag "direct-asis" '.[] | select(.tag == $tag)' >/dev/null 2>&1; then
+                            local direct_asis_out=$(jq -n '{
+                                type: "direct",
+                                tag: "direct-asis"
+                            }')
+                            outbounds=$(echo "$outbounds" | jq --argjson out "$direct_asis_out" '. + [$out]')
+                        fi
+                        ;;
                     prefer_ipv4|*)
                         if ! echo "$outbounds" | jq -e --arg tag "direct-prefer-ipv4" '.[] | select(.tag == $tag)' >/dev/null 2>&1; then
                             local direct_prefer_ipv4_out=$(jq -n '{
@@ -3541,23 +3572,18 @@ generate_singbox_config() {
                 esac
             elif [[ "$outbound" == "warp" ]]; then
                 local warp_tag=""
-                local warp_strategy=""
                 case "$ip_version" in
                     ipv4_only)
                         warp_tag="warp-ipv4"
-                        warp_strategy="ipv4_only"
                         ;;
                     ipv6_only)
                         warp_tag="warp-ipv6"
-                        warp_strategy="ipv6_only"
                         ;;
                     prefer_ipv6)
                         warp_tag="warp-prefer-ipv6"
-                        warp_strategy="prefer_ipv6"
                         ;;
                     prefer_ipv4|*)
                         warp_tag="warp-prefer-ipv4"
-                        warp_strategy="prefer_ipv4"
                         ;;
                 esac
                 if [[ "$warp_has_endpoint" == "true" ]]; then
@@ -3573,9 +3599,8 @@ generate_singbox_config() {
                                 warp_endpoint_data="$warp_endpoint"
                             fi
                         else
-                            local warp_out_with_strategy=$(echo "$warp_out" | jq --arg tag "$warp_tag" --arg ds "$warp_strategy" \
-                                '.tag = $tag | .domain_strategy = $ds')
-                            outbounds=$(echo "$outbounds" | jq --argjson out "$warp_out_with_strategy" '. + [$out]')
+                            local warp_out_with_tag=$(echo "$warp_out" | jq --arg tag "$warp_tag" '.tag = $tag')
+                            outbounds=$(echo "$outbounds" | jq --argjson out "$warp_out_with_tag" '. + [$out]')
                         fi
                     fi
                 fi
@@ -3612,12 +3637,8 @@ generate_singbox_config() {
                             warp_endpoint_data="$warp_endpoint"
                         fi
                     else
-                        # 使用默认 tag "warp"，默认策略 prefer_ipv4
+                        # 使用默认 tag "warp"
                         local warp_out_default=$(echo "$warp_out" | jq '.tag = "warp"')
-                        # 只有 WireGuard 类型才需要 domain_strategy
-                        if echo "$warp_out_default" | jq -e '.type == "wireguard"' >/dev/null 2>&1; then
-                            warp_out_default=$(echo "$warp_out_default" | jq '.domain_strategy = "prefer_ipv4"')
-                        fi
                         outbounds=$(echo "$outbounds" | jq --argjson out "$warp_out_default" '. + [$out]')
                     fi
                 fi
@@ -3792,7 +3813,6 @@ generate_singbox_config() {
                 '{
                     type: "tuic",
                     tag: "tuic-in",
-                    listen: "::",
                     listen_port: $port,
                     users: [{uuid: $uuid, password: $password}],
                     congestion_control: "bbr",
@@ -3819,7 +3839,6 @@ generate_singbox_config() {
                 '{
                     type: "shadowsocks",
                     tag: $tag,
-                    listen: "::",
                     listen_port: $port,
                     method: $method,
                     password: $password
@@ -6569,6 +6588,7 @@ gen_xray_routing_rules() {
                 ipv4_only) tag="direct-ipv4" ;;
                 ipv6_only) tag="direct-ipv6" ;;
                 prefer_ipv6) tag="direct-prefer-ipv6" ;;
+                as_is|asis) tag="direct-asis" ;;
                 *) tag="direct-prefer-ipv4" ;;
             esac
         elif [[ "$outbound" == "warp" ]]; then
@@ -6665,6 +6685,7 @@ gen_singbox_routing_rules() {
                 ipv4_only) tag="direct-ipv4" ;;
                 ipv6_only) tag="direct-ipv6" ;;
                 prefer_ipv6) tag="direct-prefer-ipv6" ;;
+                as_is|asis) tag="direct-asis" ;;
                 *) tag="direct-prefer-ipv4" ;;
             esac
         elif [[ "$outbound" == "warp" ]]; then
@@ -6809,8 +6830,8 @@ show_routing_status() {
     echo -e "  ${C}出口状态${NC}"
     _line
     
-    # 直连出口 IP 版本（默认优先 IPv6）
-    local direct_ip_version="prefer_ipv6"
+    # 直连出口 IP 版本（默认 AsIs）
+    local direct_ip_version="as_is"
     [[ -f "$CFG/direct_ip_version" ]] && direct_ip_version=$(cat "$CFG/direct_ip_version")
     local direct_display=""
     case "$direct_ip_version" in
@@ -6818,6 +6839,7 @@ show_routing_status() {
         ipv6|ipv6_only) direct_display="仅 IPv6" ;;
         prefer_ipv4) direct_display="优先 IPv4" ;;
         prefer_ipv6) direct_display="优先 IPv6" ;;
+        as_is|asis) direct_display="AsIs" ;;
         # 兜底展示异常值，避免界面空白
         *) direct_display="${Y}未知 ($direct_ip_version)${NC}" ;;
     esac
@@ -6885,6 +6907,7 @@ show_routing_status() {
                 ipv6_only) ip_mark=" ${C}[仅IPv6]${NC}" ;;
                 prefer_ipv4) ip_mark=" ${C}[优先IPv4]${NC}" ;;
                 prefer_ipv6) ip_mark=" ${C}[优先IPv6]${NC}" ;;
+                as_is|asis) ip_mark=" ${C}[AsIs]${NC}" ;;
             esac
             
             if [[ "$rule_type" == "all" ]]; then
@@ -7108,22 +7131,26 @@ _add_routing_rule() {
     local outbound=$(_select_outbound "选择出口")
     [[ -z "$outbound" ]] && return
     
-    # 选择出口 IP 版本
-    echo ""
-    echo -e "  ${Y}出站方式:${NC}"
-    echo -e "  ${G}1)${NC} 仅 IPv4（IPv6 受限或不稳定环境）"
-    echo -e "  ${G}2)${NC} 仅 IPv6（解锁 Netflix，避免同户检测）"
-    echo -e "  ${G}3)${NC} 优先 IPv4（确保兼容性）"
-    echo -e "  ${G}4)${NC} 优先 IPv6（双栈环境，优先 IPv6）"
-    read -rp "  请选择 [1-4，默认 3]: " ip_version_choice
-    
-    local ip_version="prefer_ipv4"  # 默认值
-    case "$ip_version_choice" in
-        1) ip_version="ipv4_only" ;;
-        2) ip_version="ipv6_only" ;;
-        3) ip_version="prefer_ipv4" ;;
-        4) ip_version="prefer_ipv6" ;;
-    esac
+    # 选择出口 IP 版本（仅 direct 出口需要）
+    local ip_version="as_is"  # 默认值
+    if [[ "$outbound" == "direct" ]]; then
+        echo ""
+        echo -e "  ${Y}出站方式:${NC}"
+        echo -e "  ${G}1)${NC} 仅 IPv4（IPv6 受限或不稳定环境）"
+        echo -e "  ${G}2)${NC} 仅 IPv6（解锁 Netflix，避免同户检测）"
+        echo -e "  ${G}3)${NC} 优先 IPv4（双栈环境，优先 IPv4）"
+        echo -e "  ${G}4)${NC} 优先 IPv6（双栈环境，优先 IPv6）"
+        echo -e "  ${G}5)${NC} AsIs（默认值，不做处理）"
+        read -rp "  请选择 [1-5，默认 5]: " ip_version_choice
+        
+        case "$ip_version_choice" in
+            1) ip_version="ipv4_only" ;;
+            2) ip_version="ipv6_only" ;;
+            3) ip_version="prefer_ipv4" ;;
+            4) ip_version="prefer_ipv6" ;;
+            5|"") ip_version="as_is" ;;
+        esac
+    fi
     
     # 保存规则
     if [[ "$rule_type" == "custom" ]]; then
@@ -7137,14 +7164,17 @@ _add_routing_rule() {
     [[ "$rule_type" == "all" ]] && rule_name="所有流量"
     local outbound_name=$(_get_outbound_display_name "$outbound")
     
-    # 显示 IP 版本标记
+    # 显示 IP 版本标记（仅 direct 出口）
     local ip_version_mark=""
-    case "$ip_version" in
-        ipv4_only) ip_version_mark=" ${C}[仅IPv4]${NC}" ;;
-        ipv6_only) ip_version_mark=" ${C}[仅IPv6]${NC}" ;;
-        prefer_ipv4) ip_version_mark=" ${C}[优先IPv4]${NC}" ;;
-        prefer_ipv6) ip_version_mark=" ${C}[优先IPv6]${NC}" ;;
-    esac
+    if [[ "$outbound" == "direct" ]]; then
+        case "$ip_version" in
+            ipv4_only) ip_version_mark=" ${C}[仅IPv4]${NC}" ;;
+            ipv6_only) ip_version_mark=" ${C}[仅IPv6]${NC}" ;;
+            prefer_ipv4) ip_version_mark=" ${C}[优先IPv4]${NC}" ;;
+            prefer_ipv6) ip_version_mark=" ${C}[优先IPv6]${NC}" ;;
+            as_is|asis) ip_version_mark=" ${C}[AsIs]${NC}" ;;
+        esac
+    fi
     
     _ok "已添加规则: ${rule_name} → ${outbound_name}${ip_version_mark}"
     
@@ -8421,16 +8451,17 @@ configure_direct_outbound() {
     echo -e "  ${D}适用于双栈服务器选择出口 IP${NC}"
     echo ""
     
-    # 读取当前设置，默认优先 IPv6
-    local current="prefer_ipv6"
+    # 读取当前设置，默认 AsIs
+    local current="as_is"
     [[ -f "$CFG/direct_ip_version" ]] && current=$(cat "$CFG/direct_ip_version")
     
     echo -e "  当前设置: ${G}$current${NC}"
     echo ""
     _item "1" "仅 IPv4（IPv6 受限或不稳定环境）"
     _item "2" "仅 IPv6（双栈环境，强制 IPv6）"
-    _item "3" "优先 IPv4（默认，确保兼容性）"
+    _item "3" "优先 IPv4（双栈环境，优先 IPv4）"
     _item "4" "优先 IPv6（双栈环境，优先 IPv6）"
+    _item "5" "AsIs（默认值，不做处理）"
     _item "0" "返回"
     _line
     
@@ -8442,6 +8473,7 @@ configure_direct_outbound() {
         2) new_setting="ipv6_only" ;;
         3) new_setting="prefer_ipv4" ;;
         4) new_setting="prefer_ipv6" ;;
+        5) new_setting="as_is" ;;
         0|"") return ;;
         *) _warn "无效选项"; return ;;
     esac
@@ -9056,13 +9088,12 @@ parse_subscription() {
 }
 
 # 生成 Xray 链式代理 outbound (支持指定节点名和自定义 tag)
-# 用法: gen_xray_chain_outbound [节点名] [tag]
-# 如果不传参数，使用当前激活的节点，tag 为 "chain"
-# 第三个参数 ip_mode: 可选 "ipv6" 表示仅使用 IPv6
+# 用法: gen_xray_chain_outbound [节点名] [tag] [ip_mode]
+# 第三个参数 ip_mode: ipv4_only, ipv6_only, prefer_ipv4 (默认), prefer_ipv6
 gen_xray_chain_outbound() {
     local node_name="${1:-$(db_get_chain_active)}"
     local tag="${2:-chain}"
-    local ip_mode="${3:-}"  # 可选: ipv6
+    local ip_mode="${3:-prefer_ipv4}"  # 第三个参数，默认 prefer_ipv4
     [[ -z "$node_name" ]] && return
     
     local node=$(db_get_chain_node "$node_name")
@@ -9076,9 +9107,16 @@ gen_xray_chain_outbound() {
     port=$(echo "$port" | tr -d '"' | tr -d ' ')
     [[ ! "$port" =~ ^[0-9]+$ ]] && { echo ""; return 1; }
     
-    # IPv6 优先模式的 domainStrategy
+    # 根据 ip_mode 设置 Xray 的 domainStrategy
     local domain_strategy=""
-    [[ "$ip_mode" == "ipv6" ]] && domain_strategy="PreferIPv6"
+    case "$ip_mode" in
+        ipv6_only|prefer_ipv6)
+            domain_strategy="UseIPv6"
+            ;;
+        ipv4_only|prefer_ipv4|*)
+            domain_strategy="UseIPv4"
+            ;;
+    esac
     
     case "$type" in
         socks)
@@ -9208,11 +9246,11 @@ gen_xray_chain_outbound() {
 
 # 生成 Sing-box 链式代理 outbound (支持指定节点名和自定义 tag)
 # 用法: gen_singbox_chain_outbound [节点名] [tag] [ip_mode]
-# 第三个参数 ip_mode: 可选 "ipv6" 表示优先使用 IPv6
+# 第三个参数 ip_mode: ipv4_only, ipv6_only, prefer_ipv4 (默认), prefer_ipv6
 gen_singbox_chain_outbound() {
     local node_name="${1:-$(db_get_chain_active)}"
     local tag="${2:-chain}"
-    local ip_mode="${3:-}"  # 可选: ipv6
+    local ip_mode="${3:-prefer_ipv4}"  # 第三个参数，默认 prefer_ipv4
     [[ -z "$node_name" ]] && return
     
     local node=$(db_get_chain_node "$node_name")
@@ -9222,9 +9260,16 @@ gen_singbox_chain_outbound() {
     local server=$(echo "$node" | jq -r '.server')
     local port=$(echo "$node" | jq -r '.port')
     
-    # 根据 ip_mode 设置 domain_strategy
+    # 根据 ip_mode 设置 Sing-box 的 domain_strategy
     local domain_strategy="prefer_ipv4"
-    [[ "$ip_mode" == "ipv6" ]] && domain_strategy="prefer_ipv6"
+    case "$ip_mode" in
+        ipv6_only|prefer_ipv6)
+            domain_strategy="prefer_ipv6"
+            ;;
+        ipv4_only|prefer_ipv4|*)
+            domain_strategy="prefer_ipv4"
+            ;;
+    esac
     
     case "$type" in
         socks)

@@ -152,6 +152,61 @@ db_get_all_protocols() {
     { jq -r '.xray | keys[]' "$DB_FILE" 2>/dev/null; jq -r '.singbox | keys[]' "$DB_FILE" 2>/dev/null; } | sort -u
 }
 
+# 数据库：负载均衡组
+# 添加负载均衡组
+db_add_balancer_group() {
+    local name="$1" strategy="$2" # strategy: random, leastPing, roundRobin
+    shift 2
+    local nodes=("$@")
+    
+    local nodes_json
+    nodes_json=$(printf '%s\n' "${nodes[@]}" | jq -R . | jq -s .)
+    local group_json
+    group_json=$(jq -n \
+        --arg name "$name" \
+        --arg strategy "$strategy" \
+        --argjson nodes "$nodes_json" \
+        '{name: $name, strategy: $strategy, nodes: $nodes}')
+    
+    local tmp
+    tmp=$(mktemp)
+    jq --argjson group "$group_json" \
+        '.balancer_groups = (.balancer_groups // []) + [$group]' \
+        "$DB_FILE" > "$tmp" && mv "$tmp" "$DB_FILE"
+}
+
+# 获取所有负载均衡组
+db_get_balancer_groups() {
+    [[ ! -f "$DB_FILE" ]] && echo "[]" && return
+    jq -r '.balancer_groups // []' "$DB_FILE"
+}
+
+# 获取指定负载均衡组
+db_get_balancer_group() {
+    local name="$1"
+    [[ ! -f "$DB_FILE" ]] && return 1
+    jq -r --arg name "$name" '.balancer_groups[]? | select(.name == $name)' "$DB_FILE"
+}
+
+# 删除负载均衡组
+db_delete_balancer_group() {
+    local name="$1"
+    local tmp
+    tmp=$(mktemp)
+    jq --arg name "$name" \
+        '.balancer_groups = [.balancer_groups[]? | select(.name != $name)]' \
+        "$DB_FILE" > "$tmp" && mv "$tmp" "$DB_FILE"
+}
+
+# 检查负载均衡组是否存在
+db_balancer_group_exists() {
+    local name="$1"
+    [[ ! -f "$DB_FILE" ]] && return 1
+    local exists=$(jq --arg name "$name" \
+        '[.balancer_groups[]? | select(.name == $name)] | length' "$DB_FILE")
+    [[ "$exists" -gt 0 ]]
+}
+
 #═══════════════════════════════════════════════════════════════════════════════
 #  通用配置保存函数
 #═══════════════════════════════════════════════════════════════════════════════
@@ -604,6 +659,7 @@ generate_xray_config() {
     # 收集所有需要的出口
     local outbounds="[$direct_outbound, {\"protocol\": \"blackhole\", \"tag\": \"block\"}]"
     local routing_rules=""
+    local balancers="[]"
     local has_routing=false
     
     # 获取分流规则
@@ -717,6 +773,47 @@ generate_xray_config() {
             fi
         fi
 
+        # 生成负载均衡器
+        local balancers="[]"
+        local balancer_groups=$(db_get_balancer_groups)
+        if [[ -n "$balancer_groups" && "$balancer_groups" != "[]" ]]; then
+            while IFS= read -r group_json; do
+                local group_name=$(echo "$group_json" | jq -r '.name')
+                local strategy=$(echo "$group_json" | jq -r '.strategy')
+                
+                # 构建 selector 数组 (节点 tag)
+                local selectors="[]"
+                local balancer_ip_version="prefer_ipv4"
+                local tag_suffix=""
+                case "$balancer_ip_version" in
+                    ipv4_only) tag_suffix="-ipv4" ;;
+                    ipv6_only) tag_suffix="-ipv6" ;;
+                    prefer_ipv6) tag_suffix="-prefer-ipv6" ;;
+                    prefer_ipv4|*) tag_suffix="-prefer-ipv4" ;;
+                esac
+                while IFS= read -r node_name; do
+                    [[ -z "$node_name" ]] && continue
+                    local node_tag="chain-${node_name}${tag_suffix}"
+                    selectors=$(echo "$selectors" | jq --arg tag "$node_tag" '. + [$tag]')
+                    
+                    # 确保节点 outbound 存在
+                    if ! echo "$outbounds" | jq -e --arg tag "$node_tag" '.[] | select(.tag == $tag)' >/dev/null 2>&1; then
+                        local chain_out=$(gen_xray_chain_outbound "$node_name" "$node_tag" "$balancer_ip_version")
+                        [[ -n "$chain_out" ]] && outbounds=$(echo "$outbounds" | jq --argjson out "$chain_out" '. + [$out]')
+                    fi
+                done < <(echo "$group_json" | jq -r '.nodes[]?')
+                
+                # 生成 balancer 配置
+                local balancer=$(jq -n \
+                    --arg tag "balancer-${group_name}" \
+                    --arg strategy "$strategy" \
+                    --argjson selector "$selectors" \
+                    '{tag: $tag, selector: $selector, strategy: {type: $strategy}}')
+                
+                balancers=$(echo "$balancers" | jq --argjson b "$balancer" '. + [$b]')
+            done < <(echo "$balancer_groups" | jq -c '.[]')
+        fi
+
         routing_rules=$(gen_xray_routing_rules)
         [[ -n "$routing_rules" && "$routing_rules" != "[]" ]] && has_routing=true
         
@@ -789,11 +886,11 @@ generate_xray_config() {
     
     # 构建基础配置
     if [[ "$has_routing" == "true" ]]; then
-        jq -n --argjson outbounds "$outbounds" '{
+        jq -n --argjson outbounds "$outbounds" --argjson balancers "$balancers" '{
             log: {loglevel: "warning"},
             inbounds: [],
             outbounds: $outbounds,
-            routing: {domainStrategy: "IPIfNonMatch", rules: []}
+            routing: {domainStrategy: "IPIfNonMatch", rules: [], balancers: $balancers}
         }' > "$CFG/config.json"
         
         # 添加路由规则
@@ -8497,6 +8594,84 @@ db_clear_routing_rules() {
     jq '.routing_rules = []' "$DB_FILE" > "$tmp" && mv "$tmp" "$DB_FILE"
 }
 
+#═══════════════════════════════════════════════════════════════════════════════
+# 负载均衡组管理
+#═══════════════════════════════════════════════════════════════════════════════
+
+# 数据库：添加负载均衡组
+# 用法: db_add_balancer_group "组名" "策略" "节点1" "节点2" ...
+# 策略: random(随机), leastPing(最低延迟), roundRobin(轮询)
+db_add_balancer_group() {
+    local name="$1" strategy="$2"
+    shift 2
+    local nodes=("$@")
+
+    [[ ! -f "$DB_FILE" ]] && echo '{}' > "$DB_FILE"
+
+    # 构建节点数组
+    local nodes_json=$(printf '%s\n' "${nodes[@]}" | jq -R . | jq -s .)
+
+    # 构建组对象
+    local group_json=$(jq -n \
+        --arg name "$name" \
+        --arg strategy "$strategy" \
+        --argjson nodes "$nodes_json" \
+        '{name: $name, strategy: $strategy, nodes: $nodes}')
+
+    # 写入数据库
+    local tmp=$(mktemp)
+    jq --argjson group "$group_json" \
+        '.balancer_groups = (.balancer_groups // []) + [$group]' \
+        "$DB_FILE" > "$tmp" && mv "$tmp" "$DB_FILE"
+}
+
+# 数据库：获取所有负载均衡组
+db_get_balancer_groups() {
+    [[ ! -f "$DB_FILE" ]] && echo "[]" && return
+    jq -r '.balancer_groups // []' "$DB_FILE" 2>/dev/null
+}
+
+# 数据库：获取指定负载均衡组
+db_get_balancer_group() {
+    local name="$1"
+    [[ ! -f "$DB_FILE" ]] && return 1
+    jq -r --arg name "$name" '.balancer_groups[]? | select(.name == $name)' "$DB_FILE" 2>/dev/null
+}
+
+# 数据库：删除负载均衡组
+db_delete_balancer_group() {
+    local name="$1"
+    [[ ! -f "$DB_FILE" ]] && return
+    local tmp=$(mktemp)
+    jq --arg name "$name" \
+        '.balancer_groups = [.balancer_groups[]? | select(.name != $name)]' \
+        "$DB_FILE" > "$tmp" && mv "$tmp" "$DB_FILE"
+}
+
+# 数据库：检查负载均衡组是否存在
+db_balancer_group_exists() {
+    local name="$1"
+    [[ ! -f "$DB_FILE" ]] && return 1
+    local exists=$(jq --arg name "$name" \
+        '[.balancer_groups[]? | select(.name == $name)] | length' "$DB_FILE" 2>/dev/null)
+    [[ "$exists" -gt 0 ]]
+}
+
+# 数据库：更新负载均衡组节点
+db_update_balancer_nodes() {
+    local name="$1"
+    shift
+    local nodes=("$@")
+
+    [[ ! -f "$DB_FILE" ]] && return 1
+
+    local nodes_json=$(printf '%s\n' "${nodes[@]}" | jq -R . | jq -s .)
+    local tmp=$(mktemp)
+    jq --arg name "$name" --argjson nodes "$nodes_json" \
+        '.balancer_groups = [.balancer_groups[]? | if .name == $name then .nodes = $nodes else . end]' \
+        "$DB_FILE" > "$tmp" && mv "$tmp" "$DB_FILE"
+}
+
 # 获取可用的出口列表
 _get_available_outbounds() {
     local outbounds=()
@@ -8514,7 +8689,15 @@ _get_available_outbounds() {
             [[ -n "$node_name" ]] && outbounds+=("chain:${node_name}|${node_name}")
         done < <(echo "$nodes" | jq -r '.[].name' 2>/dev/null)
     fi
-    
+
+    # 负载均衡组
+    local balancer_groups=$(db_get_balancer_groups 2>/dev/null)
+    if [[ -n "$balancer_groups" && "$balancer_groups" != "[]" ]]; then
+        while IFS= read -r group_name; do
+            [[ -n "$group_name" ]] && outbounds+=("balancer:${group_name}|负载均衡:${group_name}")
+        done < <(echo "$balancer_groups" | jq -r '.[].name' 2>/dev/null)
+    fi
+
     # 输出格式: "id|显示名" 每行一个
     printf '%s\n' "${outbounds[@]}"
 }
@@ -8540,9 +8723,9 @@ _format_latency_badge() {
     local color
     color=$(_latency_color "$latency")
     if [[ "$latency" == "超时" ]]; then
-        echo "[${color}超时${NC}]"
+        printf "%b\n" "[${color}超时${NC}]"
     elif [[ "$latency" =~ ^[0-9]+$ ]]; then
-        echo "[${color}${latency}ms${NC}]"
+        printf "%b\n" "[${color}${latency}ms${NC}]"
     else
         echo ""
     fi
@@ -8628,8 +8811,22 @@ _select_outbound() {
             display_names+=("${name}"$'\t'"${type}"$'\t'"${server}"$'\t'"${port}")
         done < <(echo "$nodes" | jq -c '.[]')
     fi
-    
-    # 检测延迟（跳过直连和 WARP）
+
+    # 负载均衡组
+    local balancer_groups=$(db_get_balancer_groups 2>/dev/null)
+    if [[ -n "$balancer_groups" && "$balancer_groups" != "[]" ]]; then
+        while IFS= read -r group_json; do
+            [[ -z "$group_json" ]] && continue
+            local group_name=$(echo "$group_json" | jq -r '.name // ""')
+            local strategy=$(echo "$group_json" | jq -r '.strategy // ""')
+            local node_list=$(echo "$group_json" | jq -r '.nodes[]?' | wc -l | tr -d ' ')
+            [[ -z "$group_name" ]] && continue
+            outbounds+=("balancer:${group_name}")
+            display_names+=("${group_name}"$'\t'"balancer"$'\t'"${strategy}"$'\t'"${node_list}节点")
+        done < <(echo "$balancer_groups" | jq -c '.[]')
+    fi
+
+    # 检测延迟（跳过直连、WARP 和负载均衡组）
     local need_latency_check=false
     for info in "${display_names[@]}"; do
         if [[ "$info" != "DIRECT" && "$info" != "WARP" ]]; then
@@ -8646,7 +8843,8 @@ _select_outbound() {
     local idx=0
     for i in "${!display_names[@]}"; do
         local info="${display_names[$i]}"
-        if [[ "$info" == "DIRECT" || "$info" == "WARP" ]]; then
+        local type=$(echo "$info" | cut -d$'\t' -f2)
+        if [[ "$info" == "DIRECT" || "$info" == "WARP" || "$type" == "balancer" ]]; then
             latency_results+=("-|$info|-")
         else
             local node_name=$(echo "$info" | cut -d$'\t' -f1)
@@ -8680,12 +8878,16 @@ _select_outbound() {
             local type=$(echo "$info" | cut -d$'\t' -f2)
             local server=$(echo "$info" | cut -d$'\t' -f3)
             local port=$(echo "$info" | cut -d$'\t' -f4)
-            local latency="${result%%|*}"
-            
-            local latency_num=99999
-            [[ "$latency" =~ ^[0-9]+$ ]] && latency_num="$latency"
-            
-            sort_data+=("${latency_num}|$i|${latency}|${name}|${type}|${server}|${port}")
+
+            if [[ "$type" == "balancer" ]]; then
+                # 负载均衡组排在 WARP 后面，排序值为 1
+                sort_data+=("1|$i|-|${name}|balancer|${server}|${port}")
+            else
+                local latency="${result%%|*}"
+                local latency_num=99999
+                [[ "$latency" =~ ^[0-9]+$ ]] && latency_num="$latency"
+                sort_data+=("${latency_num}|$i|${latency}|${name}|${type}|${server}|${port}")
+            fi
         fi
     done
     
@@ -8702,6 +8904,9 @@ _select_outbound() {
             echo -e "  ${G}${display_idx}${NC}) ${C}直连${NC} ${D}(本机 IP 出口)${NC}" >&2
         elif [[ "$name" == "WARP" ]]; then
             echo -e "  ${G}${display_idx}${NC}) WARP" >&2
+        elif [[ "$type" == "balancer" ]]; then
+            # server 字段存储的是策略，port 字段存储的是节点数量
+            echo -e "  ${G}${display_idx}${NC}) ${name} ${D}(负载均衡: ${server}, ${port})${NC}" >&2
         elif [[ -n "$latency_badge" ]]; then
             echo -e "  ${G}${display_idx}${NC}) ${latency_badge} ${name} ${D}(${type})${NC} ${D}${display_addr}${NC}" >&2
         else
@@ -8757,6 +8962,7 @@ gen_xray_routing_rules() {
         
         # 转换出口标识为 tag
         local tag="$outbound"
+        local tag_key="outboundTag"
         if [[ "$outbound" == "direct" ]]; then
             case "$ip_version" in
                 ipv4_only) tag="direct-ipv4" ;;
@@ -8782,30 +8988,35 @@ gen_xray_routing_rules() {
                 prefer_ipv6) tag="chain-${node_name}-prefer-ipv6" ;;
                 *) tag="chain-${node_name}-prefer-ipv4" ;;
             esac
+        elif [[ "$outbound" == balancer:* ]]; then
+            local group_name="${outbound#balancer:}"
+            tag="balancer-${group_name}"
+            tag_key="balancerTag"
         fi
         
         if [[ "$rule_type" == "all" ]]; then
-            result=$(echo "$result" | jq --arg tag "$tag" '. + [{"type": "field", "network": "tcp,udp", "outboundTag": $tag}]')
+            result=$(echo "$result" | jq --arg tag "$tag" --arg key "$tag_key" \
+                '. + [{"type": "field", "network": "tcp,udp", ($key): $tag}]')
         elif [[ -n "$domains" ]]; then
             # 检测是否是 geosite 规则
             if [[ "$domains" == geosite:* ]]; then
                 # 添加 domain 规则
-                result=$(echo "$result" | jq --arg geosite "$domains" --arg tag "$tag" \
-                    '. + [{"type": "field", "domain": [$geosite], "outboundTag": $tag}]')
+                result=$(echo "$result" | jq --arg geosite "$domains" --arg tag "$tag" --arg key "$tag_key" \
+                    '. + [{"type": "field", "domain": [$geosite], ($key): $tag}]')
                 
                 # 检查是否有对应的 geoip 规则需要添加（拆成独立规则，OR 关系）
                 local geoip_rule="${ROUTING_PRESETS_IP[$rule_type]:-}"
                 if [[ -n "$geoip_rule" ]]; then
-                    result=$(echo "$result" | jq --arg geoip "$geoip_rule" --arg tag "$tag" \
-                        '. + [{"type": "field", "ip": [$geoip], "outboundTag": $tag}]')
+                    result=$(echo "$result" | jq --arg geoip "$geoip_rule" --arg tag "$tag" --arg key "$tag_key" \
+                        '. + [{"type": "field", "ip": [$geoip], ($key): $tag}]')
                 fi
             elif [[ "$domains" =~ ^geoip:[^,]+(,geoip:[^,]+)*$ ]]; then
                 # geoip 规则支持多个条目
                 local geoip_array
                 geoip_array=$(echo "$domains" | tr ',' '\n' | grep -v '^$' | jq -R . 2>/dev/null | jq -s . 2>/dev/null)
                 if [[ -n "$geoip_array" && "$geoip_array" != "[]" && "$geoip_array" != "null" ]] && echo "$geoip_array" | jq empty 2>/dev/null; then
-                    result=$(echo "$result" | jq --argjson ips "$geoip_array" --arg tag "$tag" \
-                        '. + [{"type": "field", "ip": $ips, "outboundTag": $tag}]')
+                    result=$(echo "$result" | jq --argjson ips "$geoip_array" --arg tag "$tag" --arg key "$tag_key" \
+                        '. + [{"type": "field", "ip": $ips, ($key): $tag}]')
                 fi
             else
                 # 分离域名和 IP 地址
@@ -8828,7 +9039,8 @@ gen_xray_routing_rules() {
                     local domain_array
                     domain_array=$(echo "$domain_list" | tr ',' '\n' | grep -v '^$' | sed 's/^/domain:/' | jq -R . 2>/dev/null | jq -s . 2>/dev/null)
                     if [[ -n "$domain_array" && "$domain_array" != "[]" && "$domain_array" != "null" ]] && echo "$domain_array" | jq empty 2>/dev/null; then
-                        result=$(echo "$result" | jq --argjson domains "$domain_array" --arg tag "$tag" '. + [{"type": "field", "domain": $domains, "outboundTag": $tag}]')
+                        result=$(echo "$result" | jq --argjson domains "$domain_array" --arg tag "$tag" --arg key "$tag_key" \
+                            '. + [{"type": "field", "domain": $domains, ($key): $tag}]')
                     fi
                 fi
                 
@@ -8837,7 +9049,8 @@ gen_xray_routing_rules() {
                     local ip_array
                     ip_array=$(echo "$ip_list" | tr ',' '\n' | grep -v '^$' | jq -R . 2>/dev/null | jq -s . 2>/dev/null)
                     if [[ -n "$ip_array" && "$ip_array" != "[]" && "$ip_array" != "null" ]] && echo "$ip_array" | jq empty 2>/dev/null; then
-                        result=$(echo "$result" | jq --argjson ips "$ip_array" --arg tag "$tag" '. + [{"type": "field", "ip": $ips, "outboundTag": $tag}]')
+                        result=$(echo "$result" | jq --argjson ips "$ip_array" --arg tag "$tag" --arg key "$tag_key" \
+                            '. + [{"type": "field", "ip": $ips, ($key): $tag}]')
                     fi
                 fi
             fi
@@ -11966,72 +12179,43 @@ _import_alice_nodes() {
     echo -e "  ${W}导入 Alice SOCKS5 节点${NC}"
     _line
     echo -e "  ${D}Alice 提供 8 个 SOCKS5 出口 (端口 10001-10008)${NC}"
-    echo -e "  ${D}将自动检测出口 IP 和地区进行命名${NC}"
+    echo -e "  ${D}统一命名为 Alice-TW-SOCKS5-01 ~ 08${NC}"
     echo ""
-    
+
+    # 先删除所有旧的 Alice-TW-SOCKS5 节点
+    local old_nodes=$(db_get_chain_nodes 2>/dev/null)
+    local deleted=0
+    if [[ -n "$old_nodes" && "$old_nodes" != "[]" ]]; then
+        while IFS= read -r node_name; do
+            if [[ "$node_name" =~ ^Alice-TW-SOCKS5- ]]; then
+                db_del_chain_node "$node_name"
+                ((deleted++))
+            fi
+        done < <(echo "$old_nodes" | jq -r '.[].name')
+    fi
+
+    if [[ $deleted -gt 0 ]]; then
+        echo -e "  ${C}▸${NC} 清理了 $deleted 个旧节点"
+        # 同时清理相关的分流规则
+        local tmp=$(mktemp)
+        jq '.routing_rules = [.routing_rules[]? | select(.outbound | (startswith("chain:Alice-TW-SOCKS5-") | not))]' "$DB_FILE" > "$tmp" && mv "$tmp" "$DB_FILE"
+    fi
+
     local server="2a14:67c0:116::1"
     local username="alice"
     local password="alicefofo123..OVO"
     local base_port=10001
     local imported=0
-    local skipped=0
-    local failed=0
-    
-    echo -e "  ${C}▸${NC} 开始检测并导入..."
+
+    echo -e "  ${C}▸${NC} 开始导入 8 个节点..."
     echo ""
-    
+
     for i in {1..8}; do
         local port=$((base_port + i - 1))
-        printf "  检测端口 %d... " "$port"
-        
-        # 构建代理 URL
-        local proxy_url="socks5h://${username}:${password}@[${server}]:${port}"
-        
-        # 通过代理获取出口 IP 和地区信息
-        local ip_info
-        ip_info=$(curl -x "$proxy_url" -s --connect-timeout 5 --max-time 10 "http://ip-api.com/json/?fields=query,countryCode" 2>/dev/null)
-        
-        if [[ -z "$ip_info" ]]; then
-            echo -e "${R}超时${NC}"
-            ((failed++))
-            continue
-        fi
-        
-        local exit_ip=$(echo "$ip_info" | jq -r '.query // ""' 2>/dev/null)
-        local country=$(echo "$ip_info" | jq -r '.countryCode // ""' 2>/dev/null)
-        
-        if [[ -z "$exit_ip" || "$exit_ip" == "null" ]]; then
-            echo -e "${R}获取IP失败${NC}"
-            ((failed++))
-            continue
-        fi
-        
-        # 获取 IP 最后一段
-        local ip_suffix=""
-        if [[ "$exit_ip" =~ \. ]]; then
-            # IPv4: 取最后一段
-            ip_suffix="${exit_ip##*.}"
-        else
-            # IPv6: 取最后4位
-            ip_suffix="${exit_ip##*:}"
-            ip_suffix="${ip_suffix: -4}"
-        fi
-        
-        # 地区默认值
-        [[ -z "$country" || "$country" == "null" ]] && country="XX"
-        
-        # 生成节点名称: Alice-HK-SOCKS5-123
-        local name="Alice-${country}-SOCKS5-${ip_suffix}"
-        
-        echo -e "${G}${exit_ip}${NC} → ${C}${name}${NC}"
-        
-        # 检查是否已存在
-        if db_chain_node_exists "$name"; then
-            echo -e "    ${Y}⊘${NC} 已存在，跳过"
-            ((skipped++))
-            continue
-        fi
-        
+
+        # 生成节点名称: Alice-TW-SOCKS5-01, Alice-TW-SOCKS5-02, ...
+        local name=$(printf "Alice-TW-SOCKS5-%02d" "$i")
+
         # 构建节点 JSON
         local node=$(jq -n \
             --arg name "$name" \
@@ -12040,27 +12224,140 @@ _import_alice_nodes() {
             --arg username "$username" \
             --arg password "$password" \
             '{name:$name,type:"socks",server:$server,port:$port,username:$username,password:$password}')
-        
+
         if db_add_chain_node "$node"; then
+            echo -e "  ${G}✓${NC} $name ${D}(端口 $port)${NC}"
             ((imported++))
         else
-            echo -e "    ${R}✗${NC} 添加失败"
-            ((failed++))
+            echo -e "  ${R}✗${NC} $name ${D}(端口 $port, 添加失败)${NC}"
         fi
     done
     
     echo ""
     _line
-    if [[ $imported -gt 0 ]]; then
-        _ok "成功导入 $imported 个节点"
+    if [[ $imported -eq 8 ]]; then
+        _ok "成功导入全部 8 个节点"
+    elif [[ $imported -gt 0 ]]; then
+        _warn "导入了 $imported 个节点 (预期 8 个)"
+    else
+        _warn "没有成功导入任何节点"
     fi
-    [[ $skipped -gt 0 ]] && _info "跳过 $skipped 个已存在节点"
-    [[ $failed -gt 0 ]] && _warn "失败 $failed 个节点"
-    
+
     if [[ $imported -gt 0 ]]; then
         echo ""
         echo -e "  ${Y}提示:${NC} 请到 ${C}分流规则${NC} 中配置使用这些节点"
+        echo -e "  ${Y}提示:${NC} 或使用 ${C}创建负载均衡组${NC} 来自动配置负载均衡"
     fi
+    _pause
+}
+
+# 快速创建 Alice 负载均衡组
+_quick_setup_alice_balancer() {
+    _header
+    echo -e "  ${W}创建 Alice 负载均衡组${NC}"
+    _line
+
+    # 获取所有以 Alice 开头的节点
+    local all_nodes=$(db_get_chain_nodes 2>/dev/null)
+    if [[ -z "$all_nodes" || "$all_nodes" == "[]" ]]; then
+        _warn "未找到任何链式代理节点"
+        echo ""
+        echo -e "  请先导入 Alice 节点"
+        _pause
+        return
+    fi
+
+    # 筛选 Alice 节点
+    local alice_nodes=()
+    while IFS= read -r node_name; do
+        [[ "$node_name" =~ ^Alice- ]] && alice_nodes+=("$node_name")
+    done < <(echo "$all_nodes" | jq -r '.[].name')
+
+    if [[ ${#alice_nodes[@]} -eq 0 ]]; then
+        _warn "未找到 Alice 节点"
+        echo ""
+        echo -e "  请先导入 Alice 节点"
+        _pause
+        return
+    fi
+
+    echo -e "  找到 ${G}${#alice_nodes[@]}${NC} 个 Alice 节点"
+    echo -e "  ${C}▸${NC} 正在检测延迟... (并发 ${LATENCY_PARALLEL})"
+    echo ""
+
+    # 批量测速
+    local tmp_results=$(mktemp)
+    local tmp_nodes=$(mktemp)
+
+    # 为 Alice 节点创建临时 JSON 数组
+    for node_name in "${alice_nodes[@]}"; do
+        echo "$all_nodes" | jq -c --arg name "$node_name" '.[] | select(.name == $name)' >> "$tmp_nodes"
+    done
+
+    _batch_latency_nodes "$tmp_results" "$LATENCY_PARALLEL" < "$tmp_nodes"
+
+    echo -e "  ${W}节点列表 (按延迟排序):${NC}"
+    _line
+
+    # 显示节点及延迟信息
+    # _batch_latency_nodes 输出格式: latency_num|latency|name|type|server|port
+    while IFS='|' read -r latency_num latency name type server port; do
+        [[ -z "$name" ]] && continue
+        local latency_badge=$(_format_latency_badge "$latency")
+        local server_info="${D}(${server}:${port})${NC}"
+        printf "  ${C}•${NC} %-30s %b %b\n" "$name" "$latency_badge" "$server_info"
+    done < <(sort -t'|' -k1 -n "$tmp_results")
+
+    rm -f "$tmp_results" "$tmp_nodes"
+    echo ""
+
+    # 选择策略
+    echo -e "  ${W}选择负载均衡策略:${NC}"
+    echo -e "    ${C}1.${NC} random      ${D}(随机选择)${NC}"
+    echo -e "    ${C}2.${NC} leastPing   ${D}(最低延迟)${NC}"
+    echo -e "    ${C}3.${NC} roundRobin  ${D}(轮询)${NC}"
+    echo ""
+
+    local strategy_choice
+    read -p "  请选择 [1-3, 默认 2]: " strategy_choice
+    strategy_choice=${strategy_choice:-2}
+
+    local strategy
+    case "$strategy_choice" in
+        1) strategy="random" ;;
+        3) strategy="roundRobin" ;;
+        *) strategy="leastPing" ;;
+    esac
+
+    # 组名
+    local group_name="Alice-TW-SOCKS5-LB"
+    if db_balancer_group_exists "$group_name"; then
+        _warn "负载均衡组 '$group_name' 已存在"
+        echo ""
+        read -p "  是否覆盖? [y/N]: " confirm
+        if [[ ! "$confirm" =~ ^[Yy]$ ]]; then
+            _info "取消操作"
+            _pause
+            return
+        fi
+        db_delete_balancer_group "$group_name"
+    fi
+
+    # 创建负载均衡组
+    db_add_balancer_group "$group_name" "$strategy" "${alice_nodes[@]}"
+
+    echo ""
+    _line
+    _ok "负载均衡组 '$group_name' 创建成功"
+    echo ""
+    echo -e "  策略: ${C}$strategy${NC}"
+    echo -e "  节点数: ${G}${#alice_nodes[@]}${NC}"
+    echo ""
+    echo -e "  ${Y}下一步:${NC}"
+    echo -e "  1. 到 ${C}分流规则${NC} 中添加规则"
+    echo -e "  2. 出口选择 ${C}负载均衡:${group_name}${NC}"
+    echo -e "  3. 重载配置以生效"
+
     _pause
 }
 
@@ -12103,14 +12400,15 @@ manage_chain_proxy() {
         _item "1" "添加节点 (分享链接)"
         _item "2" "导入订阅"
         _item "3" "一键导入 Alice SOCKS5 (8节点)"
-        _item "4" "测试所有节点延迟"
-        _item "5" "删除节点"
-        _item "6" "禁用链式代理"
+        _item "4" "创建 Alice 负载均衡组"
+        _item "5" "测试所有节点延迟"
+        _item "6" "删除节点"
+        _item "7" "禁用链式代理"
         _item "0" "返回"
         _line
-        
+
         read -rp "  请选择: " choice
-        
+
         case "$choice" in
             1)
                 _add_chain_node_interactive
@@ -12122,6 +12420,9 @@ manage_chain_proxy() {
                 _import_alice_nodes
                 ;;
             4)
+                _quick_setup_alice_balancer
+                ;;
+            5)
                 # 测试所有节点延迟
                 _header
                 echo -e "  ${W}测试节点延迟 ${D}(仅供参考)${NC}"
@@ -12168,7 +12469,7 @@ manage_chain_proxy() {
                 _line
                 _pause
                 ;;
-            5)
+            6)
                 _header
                 echo -e "  ${W}删除节点${NC}"
                 _line
@@ -12214,7 +12515,7 @@ manage_chain_proxy() {
                 fi
                 _pause
                 ;;
-            6)
+            7)
                 local tmp=$(mktemp)
                 jq 'del(.chain_proxy.active)' "$DB_FILE" > "$tmp" && mv "$tmp" "$DB_FILE"
                 _ok "已禁用链式代理"

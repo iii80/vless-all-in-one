@@ -8812,32 +8812,23 @@ _select_outbound() {
         display_names+=("WARP")
     fi
     
-    # 链式代理节点 - 获取完整信息
+    # 链式代理节点 - 获取完整信息(优化:一次 jq 调用提取所有字段)
     if [[ "$node_count" -gt 0 ]]; then
-        while IFS= read -r node_json; do
-            [[ -z "$node_json" ]] && continue
-            local name=$(echo "$node_json" | jq -r '.name // ""')
-            local type=$(echo "$node_json" | jq -r '.type // ""')
-            local server=$(echo "$node_json" | jq -r '.server // ""')
-            local port=$(echo "$node_json" | jq -r '.port // ""')
+        while IFS=$'\t' read -r name type server port; do
             [[ -z "$name" ]] && continue
             outbounds+=("chain:${name}")
             display_names+=("${name}"$'\t'"${type}"$'\t'"${server}"$'\t'"${port}")
-        done < <(echo "$nodes" | jq -c '.[]')
+        done < <(echo "$nodes" | jq -r '.[] | [.name // "", .type // "", .server // "", .port // ""] | @tsv')
     fi
 
-    # 负载均衡组
+    # 负载均衡组(优化:一次 jq 调用提取所有字段)
     local balancer_groups=$(db_get_balancer_groups 2>/dev/null)
     if [[ -n "$balancer_groups" && "$balancer_groups" != "[]" ]]; then
-        while IFS= read -r group_json; do
-            [[ -z "$group_json" ]] && continue
-            local group_name=$(echo "$group_json" | jq -r '.name // ""')
-            local strategy=$(echo "$group_json" | jq -r '.strategy // ""')
-            local node_list=$(echo "$group_json" | jq -r '.nodes[]?' | wc -l | tr -d ' ')
+        while IFS=$'\t' read -r group_name strategy node_count; do
             [[ -z "$group_name" ]] && continue
             outbounds+=("balancer:${group_name}")
-            display_names+=("${group_name}"$'\t'"balancer"$'\t'"${strategy}"$'\t'"${node_list}节点")
-        done < <(echo "$balancer_groups" | jq -c '.[]')
+            display_names+=("${group_name}"$'\t'"balancer"$'\t'"${strategy}"$'\t'"${node_count}节点")
+        done < <(echo "$balancer_groups" | jq -r '.[] | [.name // "", .strategy // "", (.nodes | length)] | @tsv')
     fi
 
     # 检测延迟（跳过直连、WARP 和负载均衡组）
